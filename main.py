@@ -5,8 +5,11 @@ import json
 
 app = Flask(__name__)
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 URL = f"https://api.telegram.org/bot{TOKEN}/"
+
+print("TOKEN LENGTH:", len(TOKEN), flush=True)
+print("API URL:", URL, flush=True)
 
 def send_message(chat_id, text, message_thread_id=None):
     payload = {
