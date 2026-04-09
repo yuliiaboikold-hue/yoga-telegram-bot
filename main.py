@@ -45,6 +45,10 @@ def webhook():
         chat_id = message.get("chat", {}).get("id")
         text = message.get("text", "")
         message_thread_id = message.get("message_thread_id")
+        ALLOWED_THREAD_ID = 25
+
+if message_thread_id != ALLOWED_THREAD_ID:
+    return "ok"
 
         print("CHAT ID:", chat_id, flush=True)
         print("TEXT:", text, flush=True)
