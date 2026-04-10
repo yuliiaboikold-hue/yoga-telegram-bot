@@ -4,29 +4,36 @@ import os
 import json
 
 DATA_FOLDER = "data"
-
-
-def load_books():
-    books = {}
-    if not os.path.exists(DATA_FOLDER):
-        return books
-
-    for filename in os.listdir(DATA_FOLDER):
-        if filename.endswith(".txt"):
-            path = os.path.join(DATA_FOLDER, filename)
-            with open(path, "r", encoding="utf-8") as f:
-                books[filename] = f.read()
-    return books
-
-
-BOOKS = load_books()
+ALLOWED_THREAD_ID = 25  # тема "Справочник"
 
 app = Flask(__name__)
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 URL = f"https://api.telegram.org/bot{TOKEN}/"
 
-ALLOWED_THREAD_ID = 25  # тема "Справочник"
+
+def load_books():
+    books = {}
+
+    if not os.path.exists(DATA_FOLDER):
+        print(f"DATA FOLDER NOT FOUND: {DATA_FOLDER}", flush=True)
+        return books
+
+    for filename in os.listdir(DATA_FOLDER):
+        if filename.endswith(".txt"):
+            path = os.path.join(DATA_FOLDER, filename)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    books[filename] = f.read()
+                print(f"LOADED BOOK: {filename}", flush=True)
+            except Exception as e:
+                print(f"ERROR LOADING {filename}: {e}", flush=True)
+
+    print(f"TOTAL BOOKS LOADED: {len(books)}", flush=True)
+    return books
+
+
+BOOKS = load_books()
 
 
 def send_message(chat_id, text, message_thread_id=None):
@@ -34,12 +41,51 @@ def send_message(chat_id, text, message_thread_id=None):
         "chat_id": chat_id,
         "text": text
     }
+
     if message_thread_id:
         payload["message_thread_id"] = message_thread_id
 
-    response = requests.post(URL + "sendMessage", json=payload, timeout=20)
-    print("SEND MESSAGE STATUS:", response.status_code, flush=True)
-    print("SEND MESSAGE RESPONSE:", response.text, flush=True)
+    try:
+        response = requests.post(URL + "sendMessage", json=payload, timeout=20)
+        print("SEND MESSAGE STATUS:", response.status_code, flush=True)
+        print("SEND MESSAGE RESPONSE:", response.text, flush=True)
+    except Exception as e:
+        print("SEND MESSAGE ERROR:", str(e), flush=True)
+
+
+def normalize_text(text):
+    return text.lower().strip()
+
+
+def find_matches(query):
+    results = []
+    query = normalize_text(query)
+
+    for filename, content in BOOKS.items():
+        lines = content.splitlines()
+
+        for i, line in enumerate(lines):
+            clean_line = line.strip()
+
+            if not clean_line:
+                continue
+
+            if query in clean_line.lower():
+                start = max(0, i - 1)
+                end = min(len(lines), i + 2)
+
+                snippet_lines = []
+                for snippet_line in lines[start:end]:
+                    snippet_line = snippet_line.strip()
+                    if snippet_line:
+                        snippet_lines.append(snippet_line)
+
+                snippet = " ".join(snippet_lines)
+                snippet = snippet[:250]
+
+                results.append(f"{filename}\n{snippet}")
+
+    return results
 
 
 @app.route("/", methods=["GET"])
@@ -76,35 +122,30 @@ def webhook():
                 "Я бот-справочник по йога-текстам.\n\n"
                 "Доступные команды:\n"
                 "/help — показать эту инструкцию\n"
-                "/find <запрос> — найти тему или термин\n\n"
-                "Пример:\n"
+                "/find <запрос> — найти слово или фразу в загруженных книгах\n\n"
+                "Примеры:\n"
                 "/find асана\n"
-                "/find Патанджали про медитацию"
+                "/find медитация\n"
+                "/find sthira sukham asanam"
             )
             send_message(chat_id, help_text, message_thread_id)
 
         elif text.startswith("/find"):
-            query = text.replace("/find", "", 1).strip().lower()
+            query = text.replace("/find", "", 1).strip()
 
             if not query:
-                send_message(chat_id, "Напиши запрос: /find асана", message_thread_id)
+                send_message(
+                    chat_id,
+                    "Напиши запрос после команды.\nПример: /find асана",
+                    message_thread_id
+                )
             else:
-                results = []
-
-                for filename, content in BOOKS.items():
-                    blocks = content.split("---")
-
-                    for block in blocks:
-                        if query in block.lower():
-                            lines = block.strip().split("\n")
-                            if lines and lines[0].strip():
-                                ref = lines[0].replace("##", "").strip()
-                                results.append(f"{filename} → {ref}")
+                results = find_matches(query)
 
                 if not results:
-                    send_message(chat_id, "Ничего не найдено", message_thread_id)
+                    send_message(chat_id, "Ничего не найдено.", message_thread_id)
                 else:
-                    response = "Найдено:\n" + "\n".join(results[:20])
+                    response = "Найдено:\n\n" + "\n\n".join(results[:10])
                     send_message(chat_id, response, message_thread_id)
 
         else:
