@@ -1,10 +1,16 @@
 from flask import Flask, request
 import requests
 import os
+import json
+
 DATA_FOLDER = "data"
+
 
 def load_books():
     books = {}
+    if not os.path.exists(DATA_FOLDER):
+        return books
+
     for filename in os.listdir(DATA_FOLDER):
         if filename.endswith(".txt"):
             path = os.path.join(DATA_FOLDER, filename)
@@ -12,8 +18,8 @@ def load_books():
                 books[filename] = f.read()
     return books
 
+
 BOOKS = load_books()
-import json
 
 app = Flask(__name__)
 
@@ -21,6 +27,7 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 URL = f"https://api.telegram.org/bot{TOKEN}/"
 
 ALLOWED_THREAD_ID = 25  # тема "Справочник"
+
 
 def send_message(chat_id, text, message_thread_id=None):
     payload = {
@@ -34,9 +41,11 @@ def send_message(chat_id, text, message_thread_id=None):
     print("SEND MESSAGE STATUS:", response.status_code, flush=True)
     print("SEND MESSAGE RESPONSE:", response.text, flush=True)
 
+
 @app.route("/", methods=["GET"])
 def home():
     return "Bot is running!"
+
 
 @app.route("/", methods=["POST"])
 def webhook():
@@ -74,44 +83,29 @@ def webhook():
             )
             send_message(chat_id, help_text, message_thread_id)
 
-elif text.startswith("/find"):
-    query = text.replace("/find", "", 1).strip().lower()
-
-    if not query:
-        send_message(chat_id, "Напиши запрос: /find асана", message_thread_id)
-    else:
-        results = []
-
-        for filename, content in BOOKS.items():
-            blocks = content.split("---")
-
-            for block in blocks:
-                if query in block.lower():
-                    # найти reference
-                    lines = block.strip().split("\n")
-                    if lines:
-                        ref = lines[0].replace("##", "").strip()
-                        results.append(f"{filename} → {ref}")
-
-        if not results:
-            send_message(chat_id, "Ничего не найдено", message_thread_id)
-        else:
-            response = "Найдено:\n" + "\n".join(results[:20])
-            send_message(chat_id, response, message_thread_id)
-            query = text.replace("/find", "", 1).strip()
+        elif text.startswith("/find"):
+            query = text.replace("/find", "", 1).strip().lower()
 
             if not query:
-                send_message(
-                    chat_id,
-                    "Напиши запрос после команды.\nПример: /find асана",
-                    message_thread_id
-                )
+                send_message(chat_id, "Напиши запрос: /find асана", message_thread_id)
             else:
-                send_message(
-                    chat_id,
-                    f"Ищу по запросу: {query}",
-                    message_thread_id
-                )
+                results = []
+
+                for filename, content in BOOKS.items():
+                    blocks = content.split("---")
+
+                    for block in blocks:
+                        if query in block.lower():
+                            lines = block.strip().split("\n")
+                            if lines and lines[0].strip():
+                                ref = lines[0].replace("##", "").strip()
+                                results.append(f"{filename} → {ref}")
+
+                if not results:
+                    send_message(chat_id, "Ничего не найдено", message_thread_id)
+                else:
+                    response = "Найдено:\n" + "\n".join(results[:20])
+                    send_message(chat_id, response, message_thread_id)
 
         else:
             send_message(
@@ -126,8 +120,6 @@ elif text.startswith("/find"):
         print("WEBHOOK ERROR:", str(e), flush=True)
         return "error", 500
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
