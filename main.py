@@ -1,6 +1,18 @@
 from flask import Flask, request
 import requests
 import os
+DATA_FOLDER = "data"
+
+def load_books():
+    books = {}
+    for filename in os.listdir(DATA_FOLDER):
+        if filename.endswith(".txt"):
+            path = os.path.join(DATA_FOLDER, filename)
+            with open(path, "r", encoding="utf-8") as f:
+                books[filename] = f.read()
+    return books
+
+BOOKS = load_books()
 import json
 
 app = Flask(__name__)
