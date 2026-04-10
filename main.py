@@ -57,12 +57,32 @@ def normalize_text(text):
     return text.lower().strip()
 
 
+def is_useful_line(line):
+    clean = line.strip()
+
+    if not clean:
+        return False
+
+    if len(clean) < 20:
+        return False
+
+    if clean.count(".") > 10:
+        return False
+
+    if clean.isdigit():
+        return False
+
+    return True
+
+
 def find_matches(query):
     results = []
+    seen_snippets = set()
     query = normalize_text(query)
 
     for filename, content in BOOKS.items():
         lines = content.splitlines()
+        file_matches = 0
 
         for i, line in enumerate(lines):
             clean_line = line.strip()
@@ -77,13 +97,25 @@ def find_matches(query):
                 snippet_lines = []
                 for snippet_line in lines[start:end]:
                     snippet_line = snippet_line.strip()
-                    if snippet_line:
+                    if snippet_line and is_useful_line(snippet_line):
                         snippet_lines.append(snippet_line)
+
+                if not snippet_lines:
+                    continue
 
                 snippet = " ".join(snippet_lines)
                 snippet = snippet[:250]
 
+                snippet_key = snippet.lower()
+                if snippet_key in seen_snippets:
+                    continue
+
+                seen_snippets.add(snippet_key)
                 results.append(f"{filename}\n{snippet}")
+                file_matches += 1
+
+                if file_matches >= 3:
+                    break
 
     return results
 
