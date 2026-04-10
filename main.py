@@ -11,6 +11,9 @@ app = Flask(__name__)
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 URL = f"https://api.telegram.org/bot{TOKEN}/"
 
+BOOKS = {}
+LAST_RESULTS = {}  # ключ: (chat_id, thread_id) -> список найденных фрагментов
+
 
 def load_books():
     books = {}
@@ -57,65 +60,34 @@ def normalize_text(text):
     return text.lower().strip()
 
 
-def is_useful_line(line):
-    clean = line.strip()
-
-    if not clean:
-        return False
-
-    if len(clean) < 20:
-        return False
-
-    if clean.count(".") > 10:
-        return False
-
-    if clean.isdigit():
-        return False
-
-    return True
-
-
 def find_matches(query):
     results = []
-    seen_snippets = set()
     query = normalize_text(query)
 
     for filename, content in BOOKS.items():
         lines = content.splitlines()
-        file_matches = 0
 
         for i, line in enumerate(lines):
             clean_line = line.strip()
-
             if not clean_line:
                 continue
 
             if query in clean_line.lower():
-                start = max(0, i - 1)
-                end = min(len(lines), i + 2)
+                start = max(0, i - 2)
+                end = min(len(lines), i + 3)
 
                 snippet_lines = []
                 for snippet_line in lines[start:end]:
                     snippet_line = snippet_line.strip()
-                    if snippet_line and is_useful_line(snippet_line):
+                    if snippet_line:
                         snippet_lines.append(snippet_line)
 
-                if not snippet_lines:
-                    continue
+                snippet = "\n".join(snippet_lines).strip()
 
-                snippet = " ".join(snippet_lines)
-                snippet = snippet[:250]
-
-                snippet_key = snippet.lower()
-                if snippet_key in seen_snippets:
-                    continue
-
-                seen_snippets.add(snippet_key)
-                results.append(f"{filename}\n{snippet}")
-                file_matches += 1
-
-                if file_matches >= 3:
-                    break
+                results.append({
+                    "filename": filename,
+                    "snippet": snippet
+                })
 
     return results
 
@@ -149,16 +121,18 @@ def webhook():
         if not chat_id:
             return "ok"
 
+        session_key = (chat_id, message_thread_id)
+
         if text.startswith("/help"):
             help_text = (
                 "Я бот-справочник по йога-текстам.\n\n"
                 "Доступные команды:\n"
                 "/help — показать эту инструкцию\n"
-                "/find <запрос> — найти слово или фразу в загруженных книгах\n\n"
+                "/find <запрос> — найти слово или фразу\n"
+                "/open <номер> — открыть найденный фрагмент\n\n"
                 "Примеры:\n"
                 "/find асана\n"
-                "/find медитация\n"
-                "/find sthira sukham asanam"
+                "/open 1"
             )
             send_message(chat_id, help_text, message_thread_id)
 
@@ -173,12 +147,60 @@ def webhook():
                 )
             else:
                 results = find_matches(query)
+                LAST_RESULTS[session_key] = results
 
                 if not results:
                     send_message(chat_id, "Ничего не найдено.", message_thread_id)
                 else:
-                    response = "Найдено:\n\n" + "\n\n".join(results[:10])
+                    lines = ["Найдено:\n"]
+                    for idx, item in enumerate(results[:10], start=1):
+                        preview = item["snippet"].replace("\n", " ")
+                        preview = preview[:180]
+                        lines.append(f"{idx}. {item['filename']}\n{preview}\n")
+
+                    lines.append("Открой фрагмент командой: /open <номер>")
+                    response = "\n".join(lines)
                     send_message(chat_id, response, message_thread_id)
+
+        elif text.startswith("/open"):
+            arg = text.replace("/open", "", 1).strip()
+
+            if not arg:
+                send_message(
+                    chat_id,
+                    "Напиши номер результата.\nПример: /open 1",
+                    message_thread_id
+                )
+            elif session_key not in LAST_RESULTS or not LAST_RESULTS[session_key]:
+                send_message(
+                    chat_id,
+                    "Сначала сделай поиск командой /find",
+                    message_thread_id
+                )
+            else:
+                try:
+                    index = int(arg) - 1
+                    results = LAST_RESULTS[session_key]
+
+                    if index < 0 or index >= len(results):
+                        send_message(
+                            chat_id,
+                            "Нет такого номера результата.",
+                            message_thread_id
+                        )
+                    else:
+                        item = results[index]
+                        response = (
+                            f"Файл: {item['filename']}\n\n"
+                            f"{item['snippet']}"
+                        )
+                        send_message(chat_id, response, message_thread_id)
+                except ValueError:
+                    send_message(
+                        chat_id,
+                        "Номер должен быть числом.\nПример: /open 2",
+                        message_thread_id
+                    )
 
         else:
             send_message(
