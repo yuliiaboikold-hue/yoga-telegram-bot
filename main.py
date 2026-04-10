@@ -74,7 +74,30 @@ def webhook():
             )
             send_message(chat_id, help_text, message_thread_id)
 
-        elif text.startswith("/find"):
+elif text.startswith("/find"):
+    query = text.replace("/find", "", 1).strip().lower()
+
+    if not query:
+        send_message(chat_id, "Напиши запрос: /find асана", message_thread_id)
+    else:
+        results = []
+
+        for filename, content in BOOKS.items():
+            blocks = content.split("---")
+
+            for block in blocks:
+                if query in block.lower():
+                    # найти reference
+                    lines = block.strip().split("\n")
+                    if lines:
+                        ref = lines[0].replace("##", "").strip()
+                        results.append(f"{filename} → {ref}")
+
+        if not results:
+            send_message(chat_id, "Ничего не найдено", message_thread_id)
+        else:
+            response = "Найдено:\n" + "\n".join(results[:20])
+            send_message(chat_id, response, message_thread_id)
             query = text.replace("/find", "", 1).strip()
 
             if not query:
