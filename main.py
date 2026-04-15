@@ -203,12 +203,18 @@ def build_pagination_keyboard(results, page, total_pages):
 
     keyboard = []
 
-    open_row = []
-    for idx in range(start, end):
-        open_row.append({
-            "text": str(idx + 1),
-            "callback_data": f"open:{idx}"
-        })
+   open_row = []
+for idx in range(start, end):
+    item = results[idx]
+
+    url = f"https://your-reader-app.up.railway.app/?file={item['filename']}&start={item['start']}&end={item['end']}"
+
+    open_row.append({
+        "text": f"Открыть {idx + 1}",
+        "web_app": {
+            "url": url
+        }
+    })
 
     if open_row:
         keyboard.append(open_row)
