@@ -9,6 +9,7 @@ ALLOWED_THREAD_ID = 25  # тема "Справочник"
 PAGE_SIZE = 5
 MAX_RESULTS_PER_BOOK = 5
 OPEN_CONTEXT = 900  # сколько символов брать вокруг найденного места при открытии
+COMPARE_CONTEXT = 1200  # сколько символов брать для сравнения
 
 app = Flask(__name__)
 
@@ -123,6 +124,21 @@ def make_open_text(content, start_idx, end_idx, context=OPEN_CONTEXT):
     return chunk[:3500]
 
 
+def make_compare_text(content, start_idx, end_idx, context=COMPARE_CONTEXT):
+    left = max(0, start_idx - context)
+    right = min(len(content), end_idx + context)
+
+    chunk = content[left:right].strip()
+    chunk = re.sub(r"\n{3,}", "\n\n", chunk)
+
+    if left > 0:
+        chunk = "…\n" + chunk
+    if right < len(content):
+        chunk = chunk + "\n…"
+
+    return chunk[:2500]
+
+
 def find_matches(query):
     results = []
     seen = set()
@@ -175,6 +191,9 @@ def build_page_text(query, results, page):
         lines.append(item["snippet"])
         lines.append("")
 
+    lines.append("Открыть: кнопкой ниже")
+    lines.append("Сравнить: /compare 2 7")
+
     return "\n".join(lines), total_pages
 
 
@@ -184,13 +203,15 @@ def build_pagination_keyboard(results, page, total_pages):
 
     keyboard = []
 
+    open_row = []
     for idx in range(start, end):
-        keyboard.append([
-            {
-                "text": f"Открыть {idx + 1}",
-                "callback_data": f"open:{idx}"
-            }
-        ])
+        open_row.append({
+            "text": str(idx + 1),
+            "callback_data": f"open:{idx}"
+        })
+
+    if open_row:
+        keyboard.append(open_row)
 
     nav_row = []
     if page > 0:
@@ -202,6 +223,14 @@ def build_pagination_keyboard(results, page, total_pages):
         keyboard.append(nav_row)
 
     return {"inline_keyboard": keyboard} if keyboard else None
+
+
+def get_cached_results(chat_id, message_thread_id):
+    session_key = (chat_id, message_thread_id)
+    cached = SEARCH_CACHE.get(session_key)
+    if not cached:
+        return None, None
+    return cached["query"], cached["results"]
 
 
 @app.route("/", methods=["GET"])
@@ -316,14 +345,15 @@ def webhook():
                 "Я бот-справочник по йога-текстам.\n\n"
                 "Команды:\n"
                 "/help — инструкция\n"
-                "/find <запрос> — найти слово или фразу во всех книгах\n\n"
+                "/find <запрос> — найти слово или фразу во всех книгах\n"
+                "/compare <номер1> <номер2> — сравнить два результата из последнего поиска\n\n"
                 "После поиска можно:\n"
                 "— листать результаты кнопками\n"
-                "— открывать любой результат кнопкой «Открыть»\n\n"
+                "— открывать любой результат кнопкой с номером\n"
+                "— сравнивать по номерам, например: /compare 2 7\n\n"
                 "Примеры:\n"
                 "/find асана\n"
-                "/find пранаяма\n"
-                "/find sthira sukham asanam"
+                "/compare 2 7"
             )
             send_message(chat_id, help_text, message_thread_id)
 
@@ -350,6 +380,63 @@ def webhook():
                     text_out, total_pages = build_page_text(query, results, page)
                     keyboard = build_pagination_keyboard(results, page, total_pages)
                     send_message(chat_id, text_out, message_thread_id, keyboard)
+
+        elif text.startswith("/compare"):
+            args = text.replace("/compare", "", 1).strip().split()
+
+            if len(args) != 2:
+                send_message(
+                    chat_id,
+                    "Напиши два номера результата.\nПример: /compare 2 7",
+                    message_thread_id
+                )
+            else:
+                query, results = get_cached_results(chat_id, message_thread_id)
+
+                if not results:
+                    send_message(
+                        chat_id,
+                        "Сначала сделай поиск командой /find",
+                        message_thread_id
+                    )
+                else:
+                    try:
+                        first_idx = int(args[0]) - 1
+                        second_idx = int(args[1]) - 1
+
+                        if first_idx < 0 or second_idx < 0 or first_idx >= len(results) or second_idx >= len(results):
+                            send_message(
+                                chat_id,
+                                "Один из номеров выходит за пределы найденных результатов.",
+                                message_thread_id
+                            )
+                        else:
+                            first_item = results[first_idx]
+                            second_item = results[second_idx]
+
+                            first_content = BOOKS.get(first_item["filename"], "")
+                            second_content = BOOKS.get(second_item["filename"], "")
+
+                            first_text = make_compare_text(first_content, first_item["start"], first_item["end"])
+                            second_text = make_compare_text(second_content, second_item["start"], second_item["end"])
+
+                            compare_message = (
+                                f"Сравнение результатов {first_idx + 1} и {second_idx + 1}\n\n"
+                                f"——— [1] {first_item['filename']} ———\n"
+                                f"{first_text}\n\n"
+                                f"==============================\n\n"
+                                f"——— [2] {second_item['filename']} ———\n"
+                                f"{second_text}"
+                            )
+
+                            send_message(chat_id, compare_message[:4000], message_thread_id)
+
+                    except ValueError:
+                        send_message(
+                            chat_id,
+                            "Номера должны быть числами.\nПример: /compare 2 7",
+                            message_thread_id
+                        )
 
         else:
             send_message(
