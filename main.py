@@ -5,11 +5,10 @@ import json
 import re
 
 DATA_FOLDER = "data"
-ALLOWED_THREAD_ID = 25  # тема "Справочник"
+ALLOWED_THREAD_ID = 25
 PAGE_SIZE = 5
 MAX_RESULTS_PER_BOOK = 5
 OPEN_CONTEXT = 900
-COMPARE_CONTEXT = 1200
 
 app = Flask(__name__)
 
@@ -17,20 +16,43 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 URL = f"https://api.telegram.org/bot{TOKEN}/"
 
 BOOKS = {}
-SEARCH_CACHE = {}  # key: (chat_id, thread_id) -> {"query": str, "results": list}
+SEARCH_CACHE = {}
 
 
 def clean_text(text):
-    # убираем переносы слов: "пони-\nмание" -> "понимание"
+    # переносы слов: "пони-\nмание" -> "понимание"
     text = re.sub(r'(\w)-\n(\w)', r'\1\2', text)
 
-    # одиночные переносы строк внутри абзаца превращаем в пробел
-    text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
+    # нормализуем переводы строк
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # схлопываем лишние пробелы
+    # убираем лишние пробелы
     text = re.sub(r'[ \t]+', ' ', text)
 
-    # схлопываем слишком много пустых строк
+    # сохраняем абзацы, но склеиваем строки внутри абзаца
+    paragraphs = re.split(r'\n\s*\n', text)
+    cleaned_paragraphs = []
+
+    for p in paragraphs:
+        p = p.strip()
+        if not p:
+            continue
+        p = re.sub(r'\n+', ' ', p)
+        p = re.sub(r'\s+', ' ', p).strip()
+        cleaned_paragraphs.append(p)
+
+    text = "\n\n".join(cleaned_paragraphs)
+
+    # небольшая помощь спискам после двоеточий
+    text = re.sub(r'([:;])\s+—\s+', r'\1\n— ', text)
+
+    # новые строки перед нумерованными главами/разделами
+    text = re.sub(r'\s+(\d+\.\s+[А-ЯA-Z])', r'\n\n\1', text)
+
+    # новые строки перед пунктами-списками
+    text = re.sub(r'\s+—\s+', r'\n— ', text)
+
+    # схлопываем лишние пустые строки
     text = re.sub(r'\n{3,}', '\n\n', text)
 
     return text.strip()
@@ -111,11 +133,6 @@ def normalize_text(text):
 
 
 def build_word_pattern(query):
-    """
-    Ищем целое слово / словоформу, а не случайное совпадение букв.
-    Например, для 'асана' будут находиться:
-    асана, асаны, асанах, асаной...
-    """
     query = re.escape(query.strip().lower())
     return re.compile(rf"(?<!\w){query}\w*", re.IGNORECASE)
 
@@ -136,12 +153,29 @@ def make_snippet(content, start_idx, end_idx, context=180):
     return snippet[:450]
 
 
+def format_open_chunk(chunk):
+    # делаем кусок более читаемым
+    chunk = re.sub(r'\n{3,}', '\n\n', chunk)
+
+    # новые строки перед крупными разделами вида "1. Самадхи пада"
+    chunk = re.sub(r'\n?(\d+\.\s+[А-ЯA-Z][^\n]+)', r'\n\n\1', chunk)
+
+    # новые строки перед пунктами-списками
+    chunk = re.sub(r'\s+—\s+', r'\n— ', chunk)
+
+    # немного чистим пробелы
+    chunk = re.sub(r'[ \t]+', ' ', chunk)
+    chunk = re.sub(r'\n{3,}', '\n\n', chunk)
+
+    return chunk.strip()
+
+
 def make_open_text(content, start_idx, end_idx, context=OPEN_CONTEXT):
     left = max(0, start_idx - context)
     right = min(len(content), end_idx + context)
 
     chunk = content[left:right].strip()
-    chunk = re.sub(r"\n{3,}", "\n\n", chunk)
+    chunk = format_open_chunk(chunk)
 
     if left > 0:
         chunk = "…\n" + chunk
@@ -149,21 +183,6 @@ def make_open_text(content, start_idx, end_idx, context=OPEN_CONTEXT):
         chunk = chunk + "\n…"
 
     return chunk[:3500]
-
-
-def make_compare_text(content, start_idx, end_idx, context=COMPARE_CONTEXT):
-    left = max(0, start_idx - context)
-    right = min(len(content), end_idx + context)
-
-    chunk = content[left:right].strip()
-    chunk = re.sub(r"\n{3,}", "\n\n", chunk)
-
-    if left > 0:
-        chunk = "…\n" + chunk
-    if right < len(content):
-        chunk = chunk + "\n…"
-
-    return chunk[:2500]
 
 
 def is_noise_snippet(snippet):
@@ -242,7 +261,6 @@ def build_page_text(query, results, page):
         lines.append("")
 
     lines.append("Открыть: кнопкой с номером ниже")
-    lines.append("Сравнить: /compare 2 7")
 
     return "\n".join(lines), total_pages
 
@@ -273,14 +291,6 @@ def build_pagination_keyboard(results, page, total_pages):
         keyboard.append(nav_row)
 
     return {"inline_keyboard": keyboard} if keyboard else None
-
-
-def get_cached_results(chat_id, message_thread_id):
-    session_key = (chat_id, message_thread_id)
-    cached = SEARCH_CACHE.get(session_key)
-    if not cached:
-        return None, None
-    return cached["query"], cached["results"]
 
 
 @app.route("/", methods=["GET"])
@@ -395,15 +405,12 @@ def webhook():
                 "Я бот-справочник по йога-текстам.\n\n"
                 "Команды:\n"
                 "/help — инструкция\n"
-                "/find <запрос> — найти слово или фразу во всех книгах\n"
-                "/compare <номер1> <номер2> — сравнить два результата из последнего поиска\n\n"
+                "/find <запрос> — найти слово или фразу во всех книгах\n\n"
                 "После поиска можно:\n"
                 "— листать результаты кнопками\n"
-                "— открывать результат кнопкой с номером\n"
-                "— сравнивать по номерам, например: /compare 2 7\n\n"
-                "Примеры:\n"
-                "/find асана\n"
-                "/compare 2 7"
+                "— открывать результат кнопкой с номером\n\n"
+                "Пример:\n"
+                "/find асана"
             )
             send_message(chat_id, help_text, message_thread_id)
 
@@ -431,63 +438,6 @@ def webhook():
                     keyboard = build_pagination_keyboard(results, page, total_pages)
                     send_message(chat_id, text_out, message_thread_id, keyboard)
 
-        elif text.startswith("/compare"):
-            args = text.replace("/compare", "", 1).strip().split()
-
-            if len(args) != 2:
-                send_message(
-                    chat_id,
-                    "Напиши два номера результата.\nПример: /compare 2 7",
-                    message_thread_id
-                )
-            else:
-                query, results = get_cached_results(chat_id, message_thread_id)
-
-                if not results:
-                    send_message(
-                        chat_id,
-                        "Сначала сделай поиск командой /find",
-                        message_thread_id
-                    )
-                else:
-                    try:
-                        first_idx = int(args[0]) - 1
-                        second_idx = int(args[1]) - 1
-
-                        if first_idx < 0 or second_idx < 0 or first_idx >= len(results) or second_idx >= len(results):
-                            send_message(
-                                chat_id,
-                                "Один из номеров выходит за пределы найденных результатов.",
-                                message_thread_id
-                            )
-                        else:
-                            first_item = results[first_idx]
-                            second_item = results[second_idx]
-
-                            first_content = BOOKS.get(first_item["filename"], "")
-                            second_content = BOOKS.get(second_item["filename"], "")
-
-                            first_text = make_compare_text(first_content, first_item["start"], first_item["end"])
-                            second_text = make_compare_text(second_content, second_item["start"], second_item["end"])
-
-                            compare_message = (
-                                f"Сравнение результатов {first_idx + 1} и {second_idx + 1}\n\n"
-                                f"——— [1] {first_item['filename']} ———\n"
-                                f"{first_text}\n\n"
-                                f"==============================\n\n"
-                                f"——— [2] {second_item['filename']} ———\n"
-                                f"{second_text}"
-                            )
-
-                            send_message(chat_id, compare_message[:4000], message_thread_id)
-
-                    except ValueError:
-                        send_message(
-                            chat_id,
-                            "Номера должны быть числами.\nПример: /compare 2 7",
-                            message_thread_id
-                        )
-
         else:
             send_message(
                 chat_id,
@@ -500,10 +450,6 @@ def webhook():
     except Exception as e:
         print("WEBHOOK ERROR:", str(e), flush=True)
         return "error", 500
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 
 if __name__ == "__main__":
