@@ -3,12 +3,12 @@ import requests
 import os
 import json
 import re
-from collections import defaultdict
 
 DATA_FOLDER = "data"
 ALLOWED_THREAD_ID = 25  # тема "Справочник"
 PAGE_SIZE = 5
 MAX_RESULTS_PER_BOOK = 5
+OPEN_CONTEXT = 900  # сколько символов брать вокруг найденного места при открытии
 
 app = Flask(__name__)
 
@@ -108,6 +108,21 @@ def make_snippet(content, start_idx, end_idx, context=180):
     return snippet[:450]
 
 
+def make_open_text(content, start_idx, end_idx, context=OPEN_CONTEXT):
+    left = max(0, start_idx - context)
+    right = min(len(content), end_idx + context)
+
+    chunk = content[left:right].strip()
+    chunk = re.sub(r"\n{3,}", "\n\n", chunk)
+
+    if left > 0:
+        chunk = "…\n" + chunk
+    if right < len(content):
+        chunk = chunk + "\n…"
+
+    return chunk[:3500]
+
+
 def find_matches(query):
     results = []
     seen = set()
@@ -131,6 +146,8 @@ def find_matches(query):
                 seen.add(dedupe_key)
                 results.append({
                     "filename": filename,
+                    "start": idx,
+                    "end": end_idx,
                     "snippet": snippet
                 })
                 file_count += 1
@@ -161,19 +178,30 @@ def build_page_text(query, results, page):
     return "\n".join(lines), total_pages
 
 
-def build_pagination_keyboard(page, total_pages):
-    buttons = []
+def build_pagination_keyboard(results, page, total_pages):
+    start = page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, len(results))
 
-    row = []
+    keyboard = []
+
+    for idx in range(start, end):
+        keyboard.append([
+            {
+                "text": f"Открыть {idx + 1}",
+                "callback_data": f"open:{idx}"
+            }
+        ])
+
+    nav_row = []
     if page > 0:
-        row.append({"text": "⬅️ Назад", "callback_data": f"page:{page - 1}"})
+        nav_row.append({"text": "⬅️ Назад", "callback_data": f"page:{page - 1}"})
     if page < total_pages - 1:
-        row.append({"text": "Вперёд ➡️", "callback_data": f"page:{page + 1}"})
+        nav_row.append({"text": "Вперёд ➡️", "callback_data": f"page:{page + 1}"})
 
-    if row:
-        buttons.append(row)
+    if nav_row:
+        keyboard.append(nav_row)
 
-    return {"inline_keyboard": buttons} if buttons else None
+    return {"inline_keyboard": keyboard} if keyboard else None
 
 
 @app.route("/", methods=["GET"])
@@ -200,7 +228,7 @@ def webhook():
             print("CALLBACK DATA:", callback_data, flush=True)
 
             if message_thread_id != ALLOWED_THREAD_ID:
-                answer_callback_query(callback_id, "Эта пагинация работает только в теме Справочник.")
+                answer_callback_query(callback_id, "Эта функция работает только в теме Справочник.")
                 return "ok"
 
             if not chat_id or not message_id:
@@ -214,6 +242,9 @@ def webhook():
                 answer_callback_query(callback_id, "Поиск устарел. Запусти /find ещё раз.")
                 return "ok"
 
+            query = cached["query"]
+            results = cached["results"]
+
             if callback_data.startswith("page:"):
                 try:
                     page = int(callback_data.split(":")[1])
@@ -221,13 +252,40 @@ def webhook():
                     answer_callback_query(callback_id, "Некорректная страница.")
                     return "ok"
 
-                query = cached["query"]
-                results = cached["results"]
-
-                text, total_pages = build_page_text(query, results, page)
-                keyboard = build_pagination_keyboard(page, total_pages)
-                edit_message(chat_id, message_id, text, keyboard)
+                text_out, total_pages = build_page_text(query, results, page)
+                keyboard = build_pagination_keyboard(results, page, total_pages)
+                edit_message(chat_id, message_id, text_out, keyboard)
                 answer_callback_query(callback_id)
+                return "ok"
+
+            if callback_data.startswith("open:"):
+                try:
+                    index = int(callback_data.split(":")[1])
+                except ValueError:
+                    answer_callback_query(callback_id, "Некорректный результат.")
+                    return "ok"
+
+                if index < 0 or index >= len(results):
+                    answer_callback_query(callback_id, "Нет такого результата.")
+                    return "ok"
+
+                item = results[index]
+                filename = item["filename"]
+                content = BOOKS.get(filename, "")
+
+                if not content:
+                    answer_callback_query(callback_id, "Не удалось открыть файл.")
+                    return "ok"
+
+                full_text = make_open_text(content, item["start"], item["end"])
+                open_message = (
+                    f"Результат {index + 1}\n"
+                    f"Файл: {filename}\n\n"
+                    f"{full_text}"
+                )
+
+                send_message(chat_id, open_message, message_thread_id)
+                answer_callback_query(callback_id, f"Открываю {index + 1}")
                 return "ok"
 
             answer_callback_query(callback_id, "Неизвестная команда кнопки.")
@@ -259,6 +317,9 @@ def webhook():
                 "Команды:\n"
                 "/help — инструкция\n"
                 "/find <запрос> — найти слово или фразу во всех книгах\n\n"
+                "После поиска можно:\n"
+                "— листать результаты кнопками\n"
+                "— открывать любой результат кнопкой «Открыть»\n\n"
                 "Примеры:\n"
                 "/find асана\n"
                 "/find пранаяма\n"
@@ -287,7 +348,7 @@ def webhook():
                 else:
                     page = 0
                     text_out, total_pages = build_page_text(query, results, page)
-                    keyboard = build_pagination_keyboard(page, total_pages)
+                    keyboard = build_pagination_keyboard(results, page, total_pages)
                     send_message(chat_id, text_out, message_thread_id, keyboard)
 
         else:
