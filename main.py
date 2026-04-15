@@ -8,8 +8,8 @@ DATA_FOLDER = "data"
 ALLOWED_THREAD_ID = 25  # тема "Справочник"
 PAGE_SIZE = 5
 MAX_RESULTS_PER_BOOK = 5
-OPEN_CONTEXT = 900  # сколько символов брать вокруг найденного места при открытии
-COMPARE_CONTEXT = 1200  # сколько символов брать для сравнения
+OPEN_CONTEXT = 900
+COMPARE_CONTEXT = 1200
 
 app = Flask(__name__)
 
@@ -18,6 +18,22 @@ URL = f"https://api.telegram.org/bot{TOKEN}/"
 
 BOOKS = {}
 SEARCH_CACHE = {}  # key: (chat_id, thread_id) -> {"query": str, "results": list}
+
+
+def clean_text(text):
+    # убираем переносы слов: "пони-\nмание" -> "понимание"
+    text = re.sub(r'(\w)-\n(\w)', r'\1\2', text)
+
+    # одиночные переносы строк внутри абзаца превращаем в пробел
+    text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
+
+    # схлопываем лишние пробелы
+    text = re.sub(r'[ \t]+', ' ', text)
+
+    # схлопываем слишком много пустых строк
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    return text.strip()
 
 
 def load_books():
@@ -32,7 +48,8 @@ def load_books():
             path = os.path.join(DATA_FOLDER, filename)
             try:
                 with open(path, "r", encoding="utf-8") as f:
-                    books[filename] = f.read()
+                    raw = f.read()
+                    books[filename] = clean_text(raw)
                 print(f"LOADED BOOK: {filename}", flush=True)
             except Exception as e:
                 print(f"ERROR LOADING {filename}: {e}", flush=True)
@@ -93,6 +110,16 @@ def normalize_text(text):
     return text
 
 
+def build_word_pattern(query):
+    """
+    Ищем целое слово / словоформу, а не случайное совпадение букв.
+    Например, для 'асана' будут находиться:
+    асана, асаны, асанах, асаной...
+    """
+    query = re.escape(query.strip().lower())
+    return re.compile(rf"(?<!\w){query}\w*", re.IGNORECASE)
+
+
 def make_snippet(content, start_idx, end_idx, context=180):
     left = max(0, start_idx - context)
     right = min(len(content), end_idx + context)
@@ -139,36 +166,59 @@ def make_compare_text(content, start_idx, end_idx, context=COMPARE_CONTEXT):
     return chunk[:2500]
 
 
+def is_noise_snippet(snippet):
+    s = normalize_text(snippet)
+
+    noise_markers = [
+        "список основных понятий",
+        "глоссарии",
+        "глоссарий",
+        "указатель",
+        "содержание",
+        "оглавление"
+    ]
+
+    if any(marker in s for marker in noise_markers):
+        return True
+
+    if s.count(".") > 20:
+        return True
+
+    return False
+
+
 def find_matches(query):
     results = []
     seen = set()
+
     query_norm = normalize_text(query)
+    pattern = build_word_pattern(query_norm)
 
     for filename, content in BOOKS.items():
-        content_norm = content.lower()
         file_count = 0
-        search_pos = 0
 
-        while True:
-            idx = content_norm.find(query_norm, search_pos)
-            if idx == -1:
-                break
+        for match in pattern.finditer(content):
+            start_idx = match.start()
+            end_idx = match.end()
 
-            end_idx = idx + len(query_norm)
-            snippet = make_snippet(content, idx, end_idx)
+            snippet = make_snippet(content, start_idx, end_idx)
+
+            if is_noise_snippet(snippet):
+                continue
 
             dedupe_key = normalize_text(snippet)
-            if dedupe_key not in seen:
-                seen.add(dedupe_key)
-                results.append({
-                    "filename": filename,
-                    "start": idx,
-                    "end": end_idx,
-                    "snippet": snippet
-                })
-                file_count += 1
+            if dedupe_key in seen:
+                continue
 
-            search_pos = end_idx
+            seen.add(dedupe_key)
+
+            results.append({
+                "filename": filename,
+                "start": start_idx,
+                "end": end_idx,
+                "snippet": snippet
+            })
+            file_count += 1
 
             if file_count >= MAX_RESULTS_PER_BOOK:
                 break
@@ -191,7 +241,7 @@ def build_page_text(query, results, page):
         lines.append(item["snippet"])
         lines.append("")
 
-    lines.append("Открыть: кнопкой ниже")
+    lines.append("Открыть: кнопкой с номером ниже")
     lines.append("Сравнить: /compare 2 7")
 
     return "\n".join(lines), total_pages
@@ -203,18 +253,12 @@ def build_pagination_keyboard(results, page, total_pages):
 
     keyboard = []
 
-   open_row = []
-for idx in range(start, end):
-    item = results[idx]
-
-    url = f"https://your-reader-app.up.railway.app/?file={item['filename']}&start={item['start']}&end={item['end']}"
-
-    open_row.append({
-        "text": f"Открыть {idx + 1}",
-        "web_app": {
-            "url": url
-        }
-    })
+    open_row = []
+    for idx in range(start, end):
+        open_row.append({
+            "text": str(idx + 1),
+            "callback_data": f"open:{idx}"
+        })
 
     if open_row:
         keyboard.append(open_row)
@@ -355,7 +399,7 @@ def webhook():
                 "/compare <номер1> <номер2> — сравнить два результата из последнего поиска\n\n"
                 "После поиска можно:\n"
                 "— листать результаты кнопками\n"
-                "— открывать любой результат кнопкой с номером\n"
+                "— открывать результат кнопкой с номером\n"
                 "— сравнивать по номерам, например: /compare 2 7\n\n"
                 "Примеры:\n"
                 "/find асана\n"
@@ -456,6 +500,10 @@ def webhook():
     except Exception as e:
         print("WEBHOOK ERROR:", str(e), flush=True)
         return "error", 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 
 if __name__ == "__main__":
