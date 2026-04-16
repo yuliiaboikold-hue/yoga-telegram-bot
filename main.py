@@ -1,9 +1,8 @@
-from flask import Flask, request, render_template_string
+from flask import Flask, request
 import requests
 import os
 import json
 import re
-from urllib.parse import quote
 
 DATA_FOLDER = "data"
 ALLOWED_THREAD_ID = 25
@@ -21,10 +20,16 @@ SEARCH_CACHE = {}
 
 
 def clean_text(text):
+    # переносы слов: "пони-\nмание" -> "понимание"
     text = re.sub(r'(\w)-\n(\w)', r'\1\2', text)
+
+    # нормализуем переводы строк
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # убираем лишние пробелы
     text = re.sub(r'[ \t]+', ' ', text)
 
+    # сохраняем абзацы, но склеиваем строки внутри абзаца
     paragraphs = re.split(r'\n\s*\n', text)
     cleaned_paragraphs = []
 
@@ -37,9 +42,17 @@ def clean_text(text):
         cleaned_paragraphs.append(p)
 
     text = "\n\n".join(cleaned_paragraphs)
+
+    # небольшая помощь спискам после двоеточий
     text = re.sub(r'([:;])\s+—\s+', r'\1\n— ', text)
+
+    # новые строки перед нумерованными главами/разделами
     text = re.sub(r'\s+(\d+\.\s+[А-ЯA-Z])', r'\n\n\1', text)
+
+    # новые строки перед пунктами-списками
     text = re.sub(r'\s+—\s+', r'\n— ', text)
+
+    # схлопываем лишние пустые строки
     text = re.sub(r'\n{3,}', '\n\n', text)
 
     return text.strip()
@@ -141,11 +154,19 @@ def make_snippet(content, start_idx, end_idx, context=180):
 
 
 def format_open_chunk(chunk):
+    # делаем кусок более читаемым
     chunk = re.sub(r'\n{3,}', '\n\n', chunk)
+
+    # новые строки перед крупными разделами вида "1. Самадхи пада"
     chunk = re.sub(r'\n?(\d+\.\s+[А-ЯA-Z][^\n]+)', r'\n\n\1', chunk)
+
+    # новые строки перед пунктами-списками
     chunk = re.sub(r'\s+—\s+', r'\n— ', chunk)
+
+    # немного чистим пробелы
     chunk = re.sub(r'[ \t]+', ' ', chunk)
     chunk = re.sub(r'\n{3,}', '\n\n', chunk)
+
     return chunk.strip()
 
 
@@ -214,7 +235,6 @@ def find_matches(query):
                 "filename": filename,
                 "start": start_idx,
                 "end": end_idx,
-                "query": query,
                 "snippet": snippet
             })
             file_count += 1
@@ -245,12 +265,6 @@ def build_page_text(query, results, page):
     return "\n".join(lines), total_pages
 
 
-def build_reader_url(item):
-    filename = quote(item["filename"])
-    query = quote(item["query"])
-    return f"/reader?file={filename}&start={item['start']}&end={item['end']}&query={query}"
-
-
 def build_pagination_keyboard(results, page, total_pages):
     start = page * PAGE_SIZE
     end = min(start + PAGE_SIZE, len(results))
@@ -259,12 +273,9 @@ def build_pagination_keyboard(results, page, total_pages):
 
     open_row = []
     for idx in range(start, end):
-        item = results[idx]
         open_row.append({
             "text": str(idx + 1),
-            "web_app": {
-                "url": build_reader_url(item)
-            }
+            "callback_data": f"open:{idx}"
         })
 
     if open_row:
@@ -282,134 +293,9 @@ def build_pagination_keyboard(results, page, total_pages):
     return {"inline_keyboard": keyboard} if keyboard else None
 
 
-READER_TEMPLATE = """
-<!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Ридер</title>
-  <style>
-    body {
-      margin: 0;
-      font-family: system-ui, -apple-system, sans-serif;
-      background: #111;
-      color: #eee;
-    }
-    .topbar {
-      position: sticky;
-      top: 0;
-      background: #1a1a1a;
-      border-bottom: 1px solid #333;
-      padding: 14px 16px;
-      z-index: 10;
-    }
-    .title {
-      font-size: 18px;
-      font-weight: 600;
-      margin-bottom: 4px;
-      word-break: break-word;
-    }
-    .meta {
-      font-size: 13px;
-      color: #aaa;
-    }
-    .content {
-      padding: 20px 16px 40px;
-      line-height: 1.7;
-      font-size: 18px;
-      white-space: pre-wrap;
-      max-width: 900px;
-      margin: 0 auto;
-    }
-    mark {
-      background: #ffd54f;
-      color: #111;
-      padding: 0 2px;
-      border-radius: 3px;
-    }
-    #target {
-      scroll-margin-top: 80px;
-    }
-  </style>
-</head>
-<body>
-  <div class="topbar">
-    <div class="title">{{ filename }}</div>
-    <div class="meta">Запрос: {{ query }}</div>
-  </div>
-
-  <div class="content">{{ content|safe }}</div>
-
-  <script>
-    const target = document.getElementById("target");
-    if (target) {
-      target.scrollIntoView({ behavior: "smooth", block: "center" });
-    }
-  </script>
-</body>
-</html>
-"""
-
-
 @app.route("/", methods=["GET"])
 def home():
     return "Bot is running!"
-
-
-@app.route("/reader", methods=["GET"])
-def reader():
-    filename = request.args.get("file", "")
-    query = request.args.get("query", "")
-    start = request.args.get("start", type=int)
-    end = request.args.get("end", type=int)
-
-    if filename not in BOOKS:
-        return "Файл не найден", 404
-
-    content = BOOKS[filename]
-
-    if start is None or end is None:
-        return "Некорректные параметры", 400
-
-    left = max(0, start - OPEN_CONTEXT)
-    right = min(len(content), end + OPEN_CONTEXT)
-    chunk = content[left:right]
-
-    if query:
-        pattern = build_word_pattern(query)
-
-        first_done = False
-
-        def replace_first(m):
-            nonlocal first_done
-            if not first_done:
-                first_done = True
-                return f'<mark id="target">{m.group(0)}</mark>'
-            return f'<mark>{m.group(0)}</mark>'
-
-        chunk = pattern.sub(replace_first, chunk)
-    else:
-        relative_pos = start - left
-        chunk = (
-            chunk[:relative_pos]
-            + '<mark id="target">'
-            + chunk[relative_pos:end-left]
-            + '</mark>'
-            + chunk[end-left:]
-        )
-
-    chunk = chunk.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    chunk = chunk.replace("&lt;mark", "<mark").replace("/mark&gt;", "/mark>").replace('id="target"&gt;', 'id="target">')
-
-    chunk = re.sub(r'\n{3,}', '\n\n', chunk)
-
-    return render_template_string(
-        READER_TEMPLATE,
-        filename=filename,
-        query=query,
-        content=chunk
-    )
 
 
 @app.route("/", methods=["POST"])
@@ -459,6 +345,36 @@ def webhook():
                 keyboard = build_pagination_keyboard(results, page, total_pages)
                 edit_message(chat_id, message_id, text_out, keyboard)
                 answer_callback_query(callback_id)
+                return "ok"
+
+            if callback_data.startswith("open:"):
+                try:
+                    index = int(callback_data.split(":")[1])
+                except ValueError:
+                    answer_callback_query(callback_id, "Некорректный результат.")
+                    return "ok"
+
+                if index < 0 or index >= len(results):
+                    answer_callback_query(callback_id, "Нет такого результата.")
+                    return "ok"
+
+                item = results[index]
+                filename = item["filename"]
+                content = BOOKS.get(filename, "")
+
+                if not content:
+                    answer_callback_query(callback_id, "Не удалось открыть файл.")
+                    return "ok"
+
+                full_text = make_open_text(content, item["start"], item["end"])
+                open_message = (
+                    f"Результат {index + 1}\n"
+                    f"Файл: {filename}\n\n"
+                    f"{full_text}"
+                )
+
+                send_message(chat_id, open_message, message_thread_id)
+                answer_callback_query(callback_id, f"Открываю {index + 1}")
                 return "ok"
 
             answer_callback_query(callback_id, "Неизвестная команда кнопки.")
