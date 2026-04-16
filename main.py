@@ -272,11 +272,16 @@ def build_pagination_keyboard(results, page, total_pages):
     keyboard = []
 
     open_row = []
-    for idx in range(start, end):
-        open_row.append({
-            "text": str(idx + 1),
-            "callback_data": f"open:{idx}"
-        })
+base_url = os.environ.get("APP_BASE_URL", "").rstrip("/")
+
+for idx in range(start, end):
+    item = results[idx]
+    reader_url = f"{base_url}{build_reader_url(item)}"
+
+    open_row.append({
+        "text": str(idx + 1),
+        "url": reader_url
+    })
 
     if open_row:
         keyboard.append(open_row)
