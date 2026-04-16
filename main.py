@@ -266,6 +266,10 @@ def build_page_text(query, results, page):
 
 
 def build_pagination_keyboard(results, page, total_pages):
+    def build_reader_url(item):
+    filename = quote(item["filename"])
+    query = quote(item["query"])
+    return f"/reader?file={filename}&start={item['start']}&end={item['end']}&query={query}"
     start = page * PAGE_SIZE
     end = min(start + PAGE_SIZE, len(results))
 
