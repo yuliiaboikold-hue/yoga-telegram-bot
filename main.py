@@ -258,53 +258,14 @@ def build_pagination_keyboard(results, page, total_pages):
     keyboard = []
 
     open_row = []
-    base_url = os.environ.get("APP_BASE_URL", "").rstrip("/")
-
     for idx in range(start, end):
         item = results[idx]
-        reader_url = f"{base_url}{build_reader_url(item)}"
-
         open_row.append({
             "text": str(idx + 1),
-            "url": reader_url
+            "web_app": {
+                "url": build_reader_url(item)
+            }
         })
-
-    if open_row:
-        keyboard.append(open_row)
-
-    nav_row = []
-    if page > 0:
-        nav_row.append({
-            "text": "⬅️ Назад",
-            "callback_data": f"page:{page - 1}"
-        })
-
-    if page < total_pages - 1:
-        nav_row.append({
-            "text": "Вперёд ➡️",
-            "callback_data": f"page:{page + 1}"
-        })
-
-    if nav_row:
-        keyboard.append(nav_row)
-
-    return {"inline_keyboard": keyboard} if keyboard else None
-    start = page * PAGE_SIZE
-    end = min(start + PAGE_SIZE, len(results))
-
-    keyboard = []
-
-   open_row = []
-base_url = os.environ.get("APP_BASE_URL", "").rstrip("/")
-
-for idx in range(start, end):
-    item = results[idx]
-    reader_url = f"{base_url}{build_reader_url(item)}"
-
-    open_row.append({
-        "text": str(idx + 1),
-        "url": reader_url
-    })
 
     if open_row:
         keyboard.append(open_row)
