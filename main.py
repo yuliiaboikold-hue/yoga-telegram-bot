@@ -3,6 +3,7 @@ import requests
 import os
 import json
 import re
+from urllib.parse import quote
 
 DATA_FOLDER = "data"
 ALLOWED_THREAD_ID = 25
