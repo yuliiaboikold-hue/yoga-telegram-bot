@@ -9,7 +9,7 @@ DATA_FOLDER = "data"
 ALLOWED_THREAD_ID = 25
 PAGE_SIZE = 5
 MAX_RESULTS_PER_BOOK = 5
-OPEN_CONTEXT = 900
+OPEN_CONTEXT = 1800  # увеличили контекст
 
 app = Flask(__name__)
 
@@ -84,7 +84,8 @@ def tg_post(method, payload):
 def send_message(chat_id, text, message_thread_id=None, reply_markup=None):
     payload = {
         "chat_id": chat_id,
-        "text": text
+        "text": text,
+        "parse_mode": "HTML"
     }
     if message_thread_id:
         payload["message_thread_id"] = message_thread_id
@@ -98,7 +99,8 @@ def edit_message(chat_id, message_id, text, reply_markup=None):
     payload = {
         "chat_id": chat_id,
         "message_id": message_id,
-        "text": text
+        "text": text,
+        "parse_mode": "HTML"
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
@@ -149,19 +151,37 @@ def format_open_chunk(chunk):
     return chunk.strip()
 
 
-def make_open_text(content, start_idx, end_idx, context=OPEN_CONTEXT):
-    left = max(0, start_idx - context)
-    right = min(len(content), end_idx + context)
+def escape_html(text):
+    """Экранируем HTML-спецсимволы для Telegram."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    chunk = content[left:right].strip()
-    chunk = format_open_chunk(chunk)
 
-    if left > 0:
-        chunk = "…\n" + chunk
-    if right < len(content):
-        chunk = chunk + "\n…"
+def make_open_text_with_highlight(content, match_start, match_end, context=OPEN_CONTEXT):
+    """Возвращает текст с выделенной найденной фразой через <b>...</b>."""
+    left = max(0, match_start - context)
+    right = min(len(content), match_end + context)
 
-    return chunk[:3500]
+    before = content[left:match_start]
+    found = content[match_start:match_end]
+    after = content[match_end:right]
+
+    before = format_open_chunk(before)
+    after = format_open_chunk(after)
+
+    prefix = "…\n" if left > 0 else ""
+    suffix = "\n…" if right < len(content) else ""
+
+    full = (
+        prefix
+        + escape_html(before)
+        + " ‣ <b>"
+        + escape_html(found)
+        + "</b> ◂ "
+        + escape_html(after)
+        + suffix
+    )
+
+    return full[:4000]
 
 
 def is_noise_snippet(snippet):
@@ -232,22 +252,16 @@ def build_page_text(query, results, page):
     start = page * PAGE_SIZE
     end = min(start + PAGE_SIZE, total)
 
-    lines = [f"Найдено по запросу: {query}", f"Показаны {start + 1}–{end} из {total}\n"]
+    lines = [f"Найдено по запросу: <b>{escape_html(query)}</b>", f"Показаны {start + 1}–{end} из {total}\n"]
 
     for idx, item in enumerate(results[start:end], start=start + 1):
-        lines.append(f"{idx}. {item['filename']}")
-        lines.append(item["snippet"])
+        lines.append(f"{idx}. <i>{escape_html(item['filename'])}</i>")
+        lines.append(escape_html(item["snippet"]))
         lines.append("")
 
-    lines.append("Открыть: кнопкой с номером ниже")
+    lines.append("Открыть фрагмент: нажми кнопку с номером ниже")
 
     return "\n".join(lines), total_pages
-
-
-def build_reader_url(item):
-    filename = quote(item["filename"])
-    query = quote(item.get("query", ""))
-    return f"/reader?file={filename}&start={item['start']}&end={item['end']}&query={query}"
 
 
 def build_pagination_keyboard(results, page, total_pages):
@@ -256,7 +270,6 @@ def build_pagination_keyboard(results, page, total_pages):
 
     keyboard = []
 
-    # Row of numbered "open" buttons — one per result on this page
     open_row = []
     for idx in range(start, end):
         open_row.append({
@@ -267,7 +280,6 @@ def build_pagination_keyboard(results, page, total_pages):
     if open_row:
         keyboard.append(open_row)
 
-    # Navigation row
     nav_row = []
     if page > 0:
         nav_row.append({
@@ -279,6 +291,32 @@ def build_pagination_keyboard(results, page, total_pages):
         nav_row.append({
             "text": "Вперёд ➡️",
             "callback_data": f"page:{page + 1}"
+        })
+
+    if nav_row:
+        keyboard.append(nav_row)
+
+    return {"inline_keyboard": keyboard} if keyboard else None
+
+
+def build_reader_keyboard(filename, current_left, current_right, match_start, match_end):
+    """Кнопки навигации внутри открытого текста: выше / ниже."""
+    content_len = len(BOOKS.get(filename, ""))
+    keyboard = []
+    nav_row = []
+
+    if current_left > 0:
+        new_left = max(0, current_left - OPEN_CONTEXT)
+        nav_row.append({
+            "text": "⬆️ Читать выше",
+            "callback_data": f"scroll:{filename}:{new_left}:{current_left}:{match_start}:{match_end}"
+        })
+
+    if current_right < content_len:
+        new_right = min(content_len, current_right + OPEN_CONTEXT)
+        nav_row.append({
+            "text": "⬇️ Читать ниже",
+            "callback_data": f"scroll:{filename}:{current_right}:{new_right}:{match_start}:{match_end}"
         })
 
     if nav_row:
@@ -318,6 +356,42 @@ def webhook():
                 answer_callback_query(callback_id, "Не удалось обработать кнопку.")
                 return "ok"
 
+            # --- Навигация внутри текста (scroll) ---
+            if callback_data.startswith("scroll:"):
+                parts = callback_data.split(":")
+                # scroll:filename:left:right:match_start:match_end
+                if len(parts) != 6:
+                    answer_callback_query(callback_id, "Ошибка навигации.")
+                    return "ok"
+
+                _, filename, left_s, right_s, ms_s, me_s = parts
+                try:
+                    left = int(left_s)
+                    right = int(right_s)
+                    match_start = int(ms_s)
+                    match_end = int(me_s)
+                except ValueError:
+                    answer_callback_query(callback_id, "Ошибка навигации.")
+                    return "ok"
+
+                content = BOOKS.get(filename, "")
+                if not content:
+                    answer_callback_query(callback_id, "Файл не найден.")
+                    return "ok"
+
+                chunk = content[left:right].strip()
+                chunk = format_open_chunk(chunk)
+
+                prefix = "…\n" if left > 0 else ""
+                suffix = "\n…" if right < len(content) else ""
+                text_out = prefix + escape_html(chunk) + suffix
+
+                keyboard = build_reader_keyboard(filename, left, right, match_start, match_end)
+                edit_message(chat_id, message_id, text_out, keyboard)
+                answer_callback_query(callback_id)
+                return "ok"
+
+            # --- Открыть результат поиска ---
             session_key = (chat_id, message_thread_id)
             cached = SEARCH_CACHE.get(session_key)
 
@@ -360,15 +434,18 @@ def webhook():
                     answer_callback_query(callback_id, "Не удалось открыть файл.")
                     return "ok"
 
-                full_text = make_open_text(content, item["start"], item["end"])
-                open_message = (
-                    f"Результат {index + 1}\n"
-                    f"Файл: {filename}\n\n"
-                    f"{full_text}"
-                )
+                match_start = item["start"]
+                match_end = item["end"]
+                left = max(0, match_start - OPEN_CONTEXT)
+                right = min(len(content), match_end + OPEN_CONTEXT)
 
-                send_message(chat_id, open_message, message_thread_id)
-                answer_callback_query(callback_id, f"Открываю {index + 1}")
+                full_text = make_open_text_with_highlight(content, match_start, match_end)
+                header = f"📖 <i>{escape_html(filename)}</i>\n\n"
+                open_message = header + full_text
+
+                keyboard = build_reader_keyboard(filename, left, right, match_start, match_end)
+                send_message(chat_id, open_message, message_thread_id, keyboard)
+                answer_callback_query(callback_id, f"Открываю результат {index + 1}")
                 return "ok"
 
             answer_callback_query(callback_id, "Неизвестная команда кнопки.")
@@ -397,13 +474,15 @@ def webhook():
         if text.startswith("/help"):
             help_text = (
                 "Я бот-справочник по йога-текстам.\n\n"
-                "Команды:\n"
+                "<b>Команды:</b>\n"
                 "/help — инструкция\n"
-                "/find <запрос> — найти слово или фразу во всех книгах\n\n"
-                "После поиска можно:\n"
-                "— листать результаты кнопками\n"
-                "— открывать результат кнопкой с номером\n\n"
-                "Пример:\n"
+                "/find &lt;запрос&gt; — найти слово или фразу во всех книгах\n\n"
+                "<b>После поиска:</b>\n"
+                "— листай результаты кнопками ⬅️ Вперёд ➡️\n"
+                "— нажми номер чтобы открыть фрагмент\n"
+                "— в открытом тексте нажми ⬆️ или ⬇️ чтобы читать выше/ниже\n"
+                "— можно открыть несколько результатов одновременно\n\n"
+                "<b>Пример:</b>\n"
                 "/find асана"
             )
             send_message(chat_id, help_text, message_thread_id)
@@ -444,5 +523,7 @@ def webhook():
     except Exception as e:
         print("WEBHOOK ERROR:", str(e), flush=True)
         return "error", 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
