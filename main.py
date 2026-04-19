@@ -21,16 +21,10 @@ SEARCH_CACHE = {}
 
 
 def clean_text(text):
-    # переносы слов: "пони-\nмание" -> "понимание"
     text = re.sub(r'(\w)-\n(\w)', r'\1\2', text)
-
-    # нормализуем переводы строк
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # убираем лишние пробелы
     text = re.sub(r'[ \t]+', ' ', text)
 
-    # сохраняем абзацы, но склеиваем строки внутри абзаца
     paragraphs = re.split(r'\n\s*\n', text)
     cleaned_paragraphs = []
 
@@ -43,17 +37,9 @@ def clean_text(text):
         cleaned_paragraphs.append(p)
 
     text = "\n\n".join(cleaned_paragraphs)
-
-    # небольшая помощь спискам после двоеточий
     text = re.sub(r'([:;])\s+—\s+', r'\1\n— ', text)
-
-    # новые строки перед нумерованными главами/разделами
     text = re.sub(r'\s+(\d+\.\s+[А-ЯA-Z])', r'\n\n\1', text)
-
-    # новые строки перед пунктами-списками
     text = re.sub(r'\s+—\s+', r'\n— ', text)
-
-    # схлопываем лишние пустые строки
     text = re.sub(r'\n{3,}', '\n\n', text)
 
     return text.strip()
@@ -155,19 +141,11 @@ def make_snippet(content, start_idx, end_idx, context=180):
 
 
 def format_open_chunk(chunk):
-    # делаем кусок более читаемым
     chunk = re.sub(r'\n{3,}', '\n\n', chunk)
-
-    # новые строки перед крупными разделами вида "1. Самадхи пада"
     chunk = re.sub(r'\n?(\d+\.\s+[А-ЯA-Z][^\n]+)', r'\n\n\1', chunk)
-
-    # новые строки перед пунктами-списками
     chunk = re.sub(r'\s+—\s+', r'\n— ', chunk)
-
-    # немного чистим пробелы
     chunk = re.sub(r'[ \t]+', ' ', chunk)
     chunk = re.sub(r'\n{3,}', '\n\n', chunk)
-
     return chunk.strip()
 
 
@@ -268,28 +246,28 @@ def build_page_text(query, results, page):
 
 def build_reader_url(item):
     filename = quote(item["filename"])
-    query = quote(item["query"])
+    query = quote(item.get("query", ""))
     return f"/reader?file={filename}&start={item['start']}&end={item['end']}&query={query}"
+
+
+def build_pagination_keyboard(results, page, total_pages):
     start = page * PAGE_SIZE
     end = min(start + PAGE_SIZE, len(results))
 
     keyboard = []
 
+    # Row of numbered "open" buttons — one per result on this page
     open_row = []
-    base_url = os.environ.get("APP_BASE_URL", "").rstrip("/")
-
     for idx in range(start, end):
-        item = results[idx]
-        reader_url = f"{base_url}{build_reader_url(item)}"
-
         open_row.append({
             "text": str(idx + 1),
-            "url": reader_url
+            "callback_data": f"open:{idx}"
         })
 
     if open_row:
         keyboard.append(open_row)
 
+    # Navigation row
     nav_row = []
     if page > 0:
         nav_row.append({
@@ -466,7 +444,5 @@ def webhook():
     except Exception as e:
         print("WEBHOOK ERROR:", str(e), flush=True)
         return "error", 500
-
-
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
