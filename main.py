@@ -266,8 +266,7 @@ def build_page_text(query, results, page):
     return "\n".join(lines), total_pages
 
 
-def build_pagination_keyboard(results, page, total_pages):
-    def build_reader_url(item):
+def build_reader_url(item):
     filename = quote(item["filename"])
     query = quote(item["query"])
     return f"/reader?file={filename}&start={item['start']}&end={item['end']}&query={query}"
