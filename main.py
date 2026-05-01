@@ -16,14 +16,24 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 URL = f"https://api.telegram.org/bot{TOKEN}/"
 
 BOOKS = {}
-SEARCH_CACHE = {}  # только для хранения query+results на время пагинации
+SEARCH_CACHE = {}
+REPOST_CACHE = {}  # хранит текст для репоста: (chat_id, message_id) -> text
+
+# Список тем для репоста: (thread_id, название)
+# Заполни своими реальными темами!
+TOPICS = [
+    (25, "Справочник"),
+    (42, "Практика"),
+    (57, "Теория"),
+    (88, "Вопросы"),
+    (101, "Общее"),
+]
 
 
 def clean_text(text):
     text = re.sub(r'(\w)-\n(\w)', r'\1\2', text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r'[ \t]+', ' ', text)
-
     paragraphs = re.split(r'\n\s*\n', text)
     cleaned_paragraphs = []
     for p in paragraphs:
@@ -33,7 +43,6 @@ def clean_text(text):
         p = re.sub(r'\n+', ' ', p)
         p = re.sub(r'\s+', ' ', p).strip()
         cleaned_paragraphs.append(p)
-
     text = "\n\n".join(cleaned_paragraphs)
     text = re.sub(r'([:;])\s+—\s+', r'\1\n— ', text)
     text = re.sub(r'\s+(\d+\.\s+[А-ЯA-Z])', r'\n\n\1', text)
@@ -81,7 +90,7 @@ def send_message(chat_id, text, message_thread_id=None, reply_markup=None):
         payload["message_thread_id"] = message_thread_id
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    tg_post("sendMessage", payload)
+    return tg_post("sendMessage", payload)
 
 
 def edit_message(chat_id, message_id, text, reply_markup=None):
@@ -113,17 +122,29 @@ def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def make_snippet(content, start_idx, end_idx, context=180):
+def make_snippet_with_highlight(content, start_idx, end_idx, context=180):
+    """Сниппет с выделенным жирным найденным словом."""
     left = max(0, start_idx - context)
     right = min(len(content), end_idx + context)
-    snippet = content[left:right]
-    snippet = snippet.replace("\n", " ")
-    snippet = re.sub(r"\s+", " ", snippet).strip()
+
+    before = content[left:start_idx].replace("\n", " ")
+    found = content[start_idx:end_idx]
+    after = content[end_idx:right].replace("\n", " ")
+
+    before = re.sub(r"\s+", " ", before).strip()
+    after = re.sub(r"\s+", " ", after).strip()
+
+    result = ""
     if left > 0:
-        snippet = "…" + snippet
+        result += "…"
+    result += escape_html(before)
+    result += f" <b>{escape_html(found)}</b> "
+    result += escape_html(after)
     if right < len(content):
-        snippet = snippet + "…"
-    return snippet[:450]
+        result += "…"
+
+    # Обрезаем, сохраняя закрывающий тег
+    return result[:500]
 
 
 def format_open_chunk(chunk):
@@ -136,6 +157,7 @@ def format_open_chunk(chunk):
 
 
 def make_open_text_with_highlight(content, match_start, match_end, context=OPEN_CONTEXT):
+    """Открытый фрагмент: найденный участок выделен жирным."""
     left = max(0, match_start - context)
     right = min(len(content), match_end + context)
 
@@ -149,7 +171,7 @@ def make_open_text_with_highlight(content, match_start, match_end, context=OPEN_
     return (
         prefix
         + escape_html(before)
-        + " ‣ <b>" + escape_html(found) + "</b> ◂ "
+        + " <b>" + escape_html(found) + "</b> "
         + escape_html(after)
         + suffix
     )[:4000]
@@ -176,11 +198,15 @@ def find_matches(query):
         for match in pattern.finditer(content):
             start_idx = match.start()
             end_idx = match.end()
-            snippet = make_snippet(content, start_idx, end_idx)
 
-            if is_noise_snippet(snippet):
+            # Для дедупликации используем plain-текст сниппета
+            plain_snippet = content[max(0, start_idx - 180):min(len(content), end_idx + 180)]
+            plain_snippet = plain_snippet.replace("\n", " ")
+            plain_snippet = re.sub(r"\s+", " ", plain_snippet).strip()[:450]
+
+            if is_noise_snippet(plain_snippet):
                 continue
-            dedupe_key = normalize_text(snippet)
+            dedupe_key = normalize_text(plain_snippet)
             if dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
@@ -189,7 +215,7 @@ def find_matches(query):
                 "filename": filename,
                 "start": start_idx,
                 "end": end_idx,
-                "snippet": snippet
+                "snippet": plain_snippet  # plain для дедупликации, highlight строим при выводе
             })
             file_count += 1
             if file_count >= MAX_RESULTS_PER_BOOK:
@@ -199,8 +225,6 @@ def find_matches(query):
 
 
 def encode_filename(filename):
-    """Сокращаем имя файла для callback_data: убираем расширения."""
-    # Используем индекс из BOOKS чтобы не хранить длинное имя
     keys = list(BOOKS.keys())
     if filename in keys:
         return str(keys.index(filename))
@@ -208,7 +232,6 @@ def encode_filename(filename):
 
 
 def decode_filename(idx_str):
-    """Восстанавливаем имя файла по индексу."""
     try:
         idx = int(idx_str)
         keys = list(BOOKS.keys())
@@ -233,8 +256,11 @@ def build_page_text(query, results, page):
     ]
 
     for idx, item in enumerate(results[start:end], start=start + 1):
+        content = BOOKS.get(item["filename"], "")
+        # Строим сниппет с выделением прямо здесь
+        highlighted = make_snippet_with_highlight(content, item["start"], item["end"])
         lines.append(f"{idx}. <i>{escape_html(item['filename'])}</i>")
-        lines.append(escape_html(item["snippet"]))
+        lines.append(highlighted)
         lines.append("")
 
     lines.append("Открыть фрагмент: нажми кнопку с номером ниже")
@@ -242,10 +268,6 @@ def build_page_text(query, results, page):
 
 
 def build_pagination_keyboard(results, page, total_pages):
-    """
-    Кнопки открытия теперь хранят filename_idx:start:end прямо в callback_data,
-    чтобы не зависеть от кэша при перезапуске сервера.
-    """
     start = page * PAGE_SIZE
     end = min(start + PAGE_SIZE, len(results))
 
@@ -255,7 +277,6 @@ def build_pagination_keyboard(results, page, total_pages):
     for idx in range(start, end):
         item = results[idx]
         fidx = encode_filename(item["filename"])
-        # open2:fidx:start:end
         open_row.append({
             "text": str(idx + 1),
             "callback_data": f"open2:{fidx}:{item['start']}:{item['end']}"
@@ -274,7 +295,7 @@ def build_pagination_keyboard(results, page, total_pages):
     return {"inline_keyboard": keyboard} if keyboard else None
 
 
-def build_reader_keyboard(filename, current_left, current_right, match_start, match_end):
+def build_reader_keyboard(filename, current_left, current_right, match_start, match_end, include_repost=True):
     content_len = len(BOOKS.get(filename, ""))
     fidx = encode_filename(filename)
     keyboard = []
@@ -297,7 +318,34 @@ def build_reader_keyboard(filename, current_left, current_right, match_start, ma
     if nav_row:
         keyboard.append(nav_row)
 
+    # Кнопка репоста
+    if include_repost:
+        keyboard.append([{
+            "text": "📤 Репост в тему",
+            "callback_data": f"repost_pick:{fidx}:{match_start}:{match_end}"
+        }])
+
     return {"inline_keyboard": keyboard} if keyboard else None
+
+
+def build_topic_keyboard(fidx, match_start, match_end):
+    """Клавиатура выбора темы для репоста."""
+    keyboard = []
+    row = []
+    for i, (thread_id, name) in enumerate(TOPICS):
+        row.append({
+            "text": name,
+            "callback_data": f"repost_do:{fidx}:{match_start}:{match_end}:{thread_id}"
+        })
+        # По 2 кнопки в ряд
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    keyboard.append([{"text": "❌ Отмена", "callback_data": "repost_cancel"}])
+    return {"inline_keyboard": keyboard}
 
 
 @app.route("/", methods=["GET"])
@@ -331,10 +379,9 @@ def webhook():
                 answer_callback_query(callback_id, "Не удалось обработать кнопку.")
                 return "ok"
 
-            # --- Открыть фрагмент (новый формат, без кэша) ---
+            # --- Открыть фрагмент ---
             if callback_data.startswith("open2:"):
                 parts = callback_data.split(":")
-                # open2:fidx:start:end
                 if len(parts) != 4:
                     answer_callback_query(callback_id, "Ошибка кнопки.")
                     return "ok"
@@ -368,7 +415,6 @@ def webhook():
             # --- Навигация внутри текста ---
             if callback_data.startswith("scroll:"):
                 parts = callback_data.split(":")
-                # scroll:fidx:left:right:match_start:match_end
                 if len(parts) != 6:
                     answer_callback_query(callback_id, "Ошибка навигации.")
                     return "ok"
@@ -401,7 +447,7 @@ def webhook():
                 answer_callback_query(callback_id)
                 return "ok"
 
-            # --- Пагинация (требует кэша) ---
+            # --- Пагинация ---
             if callback_data.startswith("page:"):
                 session_key = (chat_id, message_thread_id)
                 cached = SEARCH_CACHE.get(session_key)
@@ -420,6 +466,80 @@ def webhook():
                 keyboard = build_pagination_keyboard(results, page, total_pages)
                 edit_message(chat_id, message_id, text_out, keyboard)
                 answer_callback_query(callback_id)
+                return "ok"
+
+            # --- Выбор темы для репоста ---
+            if callback_data.startswith("repost_pick:"):
+                parts = callback_data.split(":")
+                # repost_pick:fidx:match_start:match_end
+                if len(parts) != 4:
+                    answer_callback_query(callback_id, "Ошибка.")
+                    return "ok"
+                _, fidx, ms_s, me_s = parts
+                filename = decode_filename(fidx)
+                if not filename:
+                    answer_callback_query(callback_id, "Файл не найден.")
+                    return "ok"
+                try:
+                    match_start = int(ms_s)
+                    match_end = int(me_s)
+                except ValueError:
+                    answer_callback_query(callback_id, "Ошибка позиции.")
+                    return "ok"
+
+                keyboard = build_topic_keyboard(fidx, match_start, match_end)
+                edit_message(chat_id, message_id,
+                             "Выбери тему для репоста фрагмента:",
+                             keyboard)
+                answer_callback_query(callback_id)
+                return "ok"
+
+            # --- Выполнить репост ---
+            if callback_data.startswith("repost_do:"):
+                parts = callback_data.split(":")
+                # repost_do:fidx:match_start:match_end:thread_id
+                if len(parts) != 5:
+                    answer_callback_query(callback_id, "Ошибка.")
+                    return "ok"
+                _, fidx, ms_s, me_s, tid_s = parts
+                filename = decode_filename(fidx)
+                if not filename:
+                    answer_callback_query(callback_id, "Файл не найден.")
+                    return "ok"
+                try:
+                    match_start = int(ms_s)
+                    match_end = int(me_s)
+                    target_thread_id = int(tid_s)
+                except ValueError:
+                    answer_callback_query(callback_id, "Ошибка данных.")
+                    return "ok"
+
+                content = BOOKS.get(filename, "")
+                if not content:
+                    answer_callback_query(callback_id, "Файл не найден.")
+                    return "ok"
+
+                full_text = make_open_text_with_highlight(content, match_start, match_end)
+                header = f"📖 <i>{escape_html(filename)}</i>\n\n"
+
+                # Находим название темы
+                topic_name = next((name for tid, name in TOPICS if tid == target_thread_id), "тему")
+
+                send_message(chat_id, header + full_text, target_thread_id)
+                answer_callback_query(callback_id, f"Отправлено в «{topic_name}»!")
+
+                # Возвращаем исходное сообщение обратно (с кнопками)
+                left = max(0, match_start - OPEN_CONTEXT)
+                right = min(len(content), match_end + OPEN_CONTEXT)
+                keyboard = build_reader_keyboard(filename, left, right, match_start, match_end)
+                edit_message(chat_id, message_id, header + full_text, keyboard)
+                return "ok"
+
+            # --- Отмена репоста ---
+            if callback_data == "repost_cancel":
+                answer_callback_query(callback_id, "Отменено.")
+                # Просто закрываем меню — ничего не делаем с сообщением
+                # Можно восстановить предыдущий вид, но для этого нужен контекст
                 return "ok"
 
             answer_callback_query(callback_id, "Неизвестная команда кнопки.")
@@ -453,8 +573,9 @@ def webhook():
                 "/find &lt;запрос&gt; — найти слово или фразу во всех книгах\n\n"
                 "<b>После поиска:</b>\n"
                 "— листай результаты кнопками ⬅️ Вперёд ➡️\n"
-                "— нажми номер чтобы открыть фрагмент с выделенным словом\n"
+                "— нажми номер чтобы открыть фрагмент с <b>выделенным</b> словом\n"
                 "— в открытом тексте нажми ⬆️ или ⬇️ чтобы читать выше/ниже\n"
+                "— нажми 📤 Репост в тему чтобы поделиться фрагментом\n"
                 "— можно открыть несколько результатов одновременно\n\n"
                 "<b>Пример:</b>\n"
                 "/find асана"
