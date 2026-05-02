@@ -112,30 +112,43 @@ def answer_callback_query(callback_query_id, text=None):
 
 def fetch_forum_topics(chat_id):
     """
-    Получает список тем форума через getForumTopics.
-    Возвращает список (thread_id, name) или [] если не удалось.
+    Получает список тем форума.
+    Пробует оба формата chat_id: как есть и с префиксом -100.
     """
     global TOPICS
-    try:
-        resp = requests.get(
-            URL + "getForumTopics",
-            params={"chat_id": chat_id, "limit": 100},
-            timeout=15
-        )
-        data = resp.json()
-        print("getForumTopics RESPONSE:", json.dumps(data, ensure_ascii=False), flush=True)
-        if data.get("ok"):
-            topics = []
-            for t in data["result"].get("topics", []):
-                tid  = t.get("message_thread_id")
-                name = t.get("name", f"Тема {tid}")
-                if tid and tid != ALLOWED_THREAD_ID:
-                    topics.append((tid, name))
-            TOPICS = topics
-            print(f"TOPICS LOADED: {TOPICS}", flush=True)
-            return topics
-    except Exception as e:
-        print(f"fetch_forum_topics ERROR: {e}", flush=True)
+
+    candidates = [chat_id]
+    # Если chat_id положительный — пробуем также -100{chat_id}
+    if str(chat_id).lstrip("-").isdigit() and not str(chat_id).startswith("-100"):
+        candidates.append(int(f"-100{str(chat_id).lstrip('-')}"))
+
+    for cid in candidates:
+        try:
+            print(f"Trying getForumTopics with chat_id={cid}", flush=True)
+            resp = requests.get(
+                URL + "getForumTopics",
+                params={"chat_id": cid, "limit": 100},
+                timeout=15
+            )
+            data = resp.json()
+            print("getForumTopics RESPONSE:", json.dumps(data, ensure_ascii=False), flush=True)
+
+            if data.get("ok"):
+                topics = []
+                for t in data["result"].get("topics", []):
+                    tid  = t.get("message_thread_id")
+                    name = t.get("name", f"Тема {tid}")
+                    if tid and tid != ALLOWED_THREAD_ID:
+                        topics.append((tid, name))
+                TOPICS = topics
+                print(f"TOPICS LOADED ({len(topics)}): {TOPICS}", flush=True)
+                return topics
+            else:
+                print(f"getForumTopics error for {cid}: {data.get('description')}", flush=True)
+
+        except Exception as e:
+            print(f"fetch_forum_topics ERROR for {cid}: {e}", flush=True)
+
     return []
 
 
@@ -161,8 +174,8 @@ def escape_html(text):
 def make_snippet_with_highlight(content, start_idx, end_idx, context=180):
     """
     Сниппет для первичного поиска:
-    - найденное слово обёрнуто в ✦ ... ✦ + жирный
-    - контекст курсивом для мягкого отличия от заголовка
+    - контекст: обычный текст (без курсива)
+    - найденное слово: ✦ жирный ✦
     """
     left  = max(0, start_idx - context)
     right = min(len(content), end_idx + context)
@@ -171,15 +184,14 @@ def make_snippet_with_highlight(content, start_idx, end_idx, context=180):
     found  = content[start_idx:end_idx]
     after  = re.sub(r"\s+", " ", content[end_idx:right].replace("\n", " ")).strip()
 
-    result = "<i>"
+    result = ""
     if left > 0:
         result += "…"
     result += escape_html(before)
-    result += f"</i> ✦ <b>{escape_html(found)}</b> ✦ <i>"
+    result += f" ✦ <b>{escape_html(found)}</b> ✦ "
     result += escape_html(after)
     if right < len(content):
         result += "…"
-    result += "</i>"
     return result[:600]
 
 
@@ -195,8 +207,8 @@ def format_open_chunk(chunk):
 def make_open_text_with_highlight(content, match_start, match_end, context=OPEN_CONTEXT):
     """
     Открытый фрагмент:
-    - найденный участок обёрнут в ✦ ... ✦ + жирный
-    - остальной текст как обычно
+    - найденный кусок: курсив <i>текст</i>
+    - остальной текст: обычный
     """
     left  = max(0, match_start - context)
     right = min(len(content), match_end + context)
@@ -211,7 +223,7 @@ def make_open_text_with_highlight(content, match_start, match_end, context=OPEN_
     return (
         prefix
         + escape_html(before)
-        + f" ✦ <b>{escape_html(found)}</b> ✦ "
+        + f" <i>{escape_html(found)}</i> "
         + escape_html(after)
         + suffix
     )[:4000]
@@ -318,9 +330,9 @@ def build_pagination_keyboard(results, page, total_pages):
     start = page * PAGE_SIZE
     end   = min(start + PAGE_SIZE, len(results))
 
-    keyboard = []
+    keyboard  = []
+    open_row  = []
 
-    open_row = []
     for idx in range(start, end):
         item = results[idx]
         fidx = encode_filename(item["filename"])
@@ -372,10 +384,6 @@ def build_reader_keyboard(filename, current_left, current_right, match_start, ma
 
 
 def build_topic_keyboard(chat_id, fidx, match_start, match_end):
-    """
-    Строит клавиатуру из реальных тем форума.
-    Если темы ещё не загружены — загружает сейчас.
-    """
     global TOPICS
     if not TOPICS:
         fetch_forum_topics(chat_id)
@@ -603,7 +611,7 @@ def webhook():
 
         session_key = (chat_id, message_thread_id)
 
-        # ── /topics — проверка тем ──
+        # ── /topics — диагностика ──
         if text.startswith("/topics"):
             topics = fetch_forum_topics(chat_id)
             if topics:
@@ -612,9 +620,15 @@ def webhook():
                     lines.append(f"• {escape_html(name)} — <code>{tid}</code>")
                 send_message(chat_id, "\n".join(lines), message_thread_id)
             else:
+                # Показываем сырой chat_id для диагностики
                 send_message(
                     chat_id,
-                    "Темы не найдены. Убедись что бот — администратор группы.",
+                    f"Темы не найдены.\n"
+                    f"chat_id в запросе: <code>{chat_id}</code>\n"
+                    f"Убедись что:\n"
+                    f"1. Бот — администратор группы\n"
+                    f"2. В группе включены темы (Topics)\n"
+                    f"3. Это супергруппа, а не обычная группа",
                     message_thread_id
                 )
 
@@ -624,10 +638,10 @@ def webhook():
                 "<b>Команды:</b>\n"
                 "/help — инструкция\n"
                 "/find &lt;запрос&gt; — найти слово или фразу\n"
-                "/topics — список тем (для проверки)\n\n"
+                "/topics — список тем (диагностика)\n\n"
                 "<b>После поиска:</b>\n"
                 "— найденное слово выделено ✦ маркерами ✦\n"
-                "— нажми номер — откроется фрагмент с выделенным участком\n"
+                "— нажми номер — откроется фрагмент, найденный кусок курсивом\n"
                 "— ⬆️ ⬇️ — читать выше/ниже\n"
                 "— 📤 Репост в тему — поделиться фрагментом\n\n"
                 "<b>Пример:</b> /find асана"
