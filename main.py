@@ -18,11 +18,15 @@ URL = f"https://api.telegram.org/bot{TOKEN}/"
 BOOKS = {}
 SEARCH_CACHE = {}
 
-# Темы задаются переменной окружения TOPICS_CONFIG в формате:
-# "25:Справочник,42:Практика,57:Теория"
-# Если переменная не задана — бот сообщит об этом при репосте
+
+# ──────────────────────────────────────────────
+# ЗАГРУЗКА ТЕМ
+# ──────────────────────────────────────────────
+
 def load_topics():
     raw = os.environ.get("TOPICS_CONFIG", "").strip()
+    print(f"TOPICS_CONFIG RAW VALUE: '{raw}'", flush=True)
+    print(f"ALL ENV VARS WITH TOPIC: { {k: v for k, v in os.environ.items() if 'TOPIC' in k.upper()} }", flush=True)
     if not raw:
         return []
     topics = []
@@ -34,7 +38,7 @@ def load_topics():
         try:
             topics.append((int(tid_s.strip()), name.strip()))
         except ValueError:
-            pass
+            print(f"TOPICS parse error for part: '{part}'", flush=True)
     print(f"TOPICS LOADED: {topics}", flush=True)
     return topics
 
@@ -186,7 +190,7 @@ def format_open_chunk(chunk):
 def make_open_text_with_highlight(content, match_start, match_end, context=OPEN_CONTEXT):
     """
     Открытый фрагмент:
-    - найденный кусок: курсив
+    - найденный кусок: курсив + ✦ маркеры — виден при скролле
     - остальной текст: обычный
     """
     left  = max(0, match_start - context)
@@ -202,10 +206,42 @@ def make_open_text_with_highlight(content, match_start, match_end, context=OPEN_
     return (
         prefix
         + escape_html(before)
-        + f" <i>{escape_html(found)}</i> "
+        + f" ✦ <b><i>{escape_html(found)}</i></b> ✦ "
         + escape_html(after)
         + suffix
     )[:4000]
+
+
+def make_scroll_text(content, left, right, match_start, match_end):
+    """
+    Текст при скролле выше/ниже:
+    - если найденный участок попадает в видимый диапазон — выделяем его
+    - иначе обычный текст с подсказкой где искать
+    """
+    chunk = content[left:right]
+
+    # Проверяем попадает ли найденный участок в текущий диапазон
+    if left <= match_start < right and left < match_end <= right:
+        # Участок виден — выделяем
+        rel_start = match_start - left
+        rel_end   = match_end - left
+
+        before = format_open_chunk(chunk[:rel_start])
+        found  = chunk[rel_start:rel_end]
+        after  = format_open_chunk(chunk[rel_end:])
+
+        text_out = (
+            escape_html(before)
+            + f" ✦ <b><i>{escape_html(found)}</i></b> ✦ "
+            + escape_html(after)
+        )
+    else:
+        # Участок не виден — показываем обычный текст
+        text_out = escape_html(format_open_chunk(chunk))
+
+    prefix = "…\n" if left > 0 else ""
+    suffix = "\n…" if right < len(content) else ""
+    return (prefix + text_out + suffix)[:4000]
 
 
 def is_noise_snippet(snippet):
@@ -462,10 +498,7 @@ def webhook():
                     return "ok"
 
                 content  = BOOKS.get(filename, "")
-                chunk    = format_open_chunk(content[left:right].strip())
-                prefix   = "…\n" if left > 0 else ""
-                suffix   = "\n…" if right < len(content) else ""
-                text_out = prefix + escape_html(chunk) + suffix
+                text_out = make_scroll_text(content, left, right, match_start, match_end)
 
                 keyboard = build_reader_keyboard(filename, left, right, match_start, match_end)
                 edit_message(chat_id, message_id, text_out, keyboard)
@@ -511,11 +544,9 @@ def webhook():
                     edit_message(
                         chat_id, message_id,
                         "⚠️ Темы не настроены.\n\n"
-                        "Администратору нужно задать переменную окружения "
-                        "<code>TOPICS_CONFIG</code> в формате:\n"
-                        "<code>25:Справочник,42:Практика,57:Теория</code>\n\n"
-                        "ID каждой темы можно узнать командой /topics_debug "
-                        "в нужной теме.",
+                        "Задай переменную окружения <code>TOPICS_CONFIG</code>:\n"
+                        "<code>25:guide,209:process,2:rules</code>\n\n"
+                        "ID темы — команда /topics_debug в нужной теме.",
                         {"inline_keyboard": [[{"text": "❌ Закрыть", "callback_data": "repost_cancel"}]]}
                     )
                     answer_callback_query(callback_id)
@@ -581,34 +612,29 @@ def webhook():
         print("TEXT:", text, flush=True)
         print("THREAD ID:", message_thread_id, flush=True)
 
-        if message_thread_id != ALLOWED_THREAD_ID:
-            # Отвечаем на /topics_debug в ЛЮБОЙ теме — для получения её ID
-            if text.startswith("/topics_debug"):
-                send_message(
-                    chat_id,
-                    f"Эта тема: <code>{message_thread_id}</code>",
-                    message_thread_id
-                )
+        # /topics_debug отвечает в ЛЮБОЙ теме
+        if text.startswith("/topics_debug"):
+            raw = os.environ.get("TOPICS_CONFIG", "НЕ ЗАДАНА")
+            send_message(
+                chat_id,
+                f"Эта тема: <code>{message_thread_id}</code>\n\n"
+                f"TOPICS_CONFIG = <code>{escape_html(raw)}</code>\n\n"
+                + (
+                    "\n".join(f"• {name} — <code>{tid}</code>" for tid, name in TOPICS)
+                    if TOPICS else "<i>темы не загружены</i>"
+                ),
+                message_thread_id
+            )
             return "ok"
 
+        if message_thread_id != ALLOWED_THREAD_ID:
+            return "ok"
         if not chat_id:
             return "ok"
 
         session_key = (chat_id, message_thread_id)
 
-        if text.startswith("/topics_debug"):
-            send_message(
-                chat_id,
-                f"Эта тема: <code>{message_thread_id}</code>\n\n"
-                f"Текущий TOPICS_CONFIG:\n"
-                + (
-                    "\n".join(f"• {name} — <code>{tid}</code>" for tid, name in TOPICS)
-                    if TOPICS else "<i>не задан</i>"
-                ),
-                message_thread_id
-            )
-
-        elif text.startswith("/help"):
+        if text.startswith("/help"):
             help_text = (
                 "Я бот-справочник по йога-текстам.\n\n"
                 "<b>Команды:</b>\n"
@@ -617,8 +643,8 @@ def webhook():
                 "/topics_debug — показать ID этой темы\n\n"
                 "<b>После поиска:</b>\n"
                 "— найденное слово выделено ✦ маркерами ✦\n"
-                "— нажми номер — откроется фрагмент, найденный кусок курсивом\n"
-                "— ⬆️ ⬇️ — читать выше/ниже\n"
+                "— нажми номер — откроется фрагмент, найденный кусок выделен\n"
+                "— ⬆️ ⬇️ — читать выше/ниже, выделение сохраняется если участок виден\n"
                 "— 📤 Репост в тему — поделиться фрагментом\n\n"
                 "<b>Пример:</b> /find асана"
             )
